@@ -3,8 +3,9 @@
 Home Assistant Driver
 =====================
 
-The Home Assistant driver enables VOLTTRON to read any data point from any Home Assistant controlled device.
-Currently control(write access) is supported only for lights(state and brightness) and thermostats(state and temperature).
+The Home Assistant driver enables VOLTTRON to read data points from Home Assistant entities you list in the registry.
+Write access is supported for a subset of entity types (for example lights, climate/thermostats, ``input_boolean``,
+and ``switch``); see :ref:`HomeAssistant-Customer-Guide` for an end-user oriented summary and extension notes.
 
 The following diagram shows interaction between platform driver agent and home assistant driver.
 
@@ -63,8 +64,8 @@ Registry Configuration
 Registry file can contain one single device and its attributes or a logical group of devices and its
 attributes. Each entry should include the full entity id of the device, including but not limited to home assistant provided prefix
 such as "light.",  "climate." etc. The driver uses these prefixes to convert states into integers.
-Like mentioned before, the driver can only control lights and thermostats but can get data from all devices
-controlled by home assistant
+Write access is limited to entity types and points implemented in the driver (see
+:ref:`HomeAssistant-Customer-Guide`); scraping can still expose additional read-only points you add to the registry.
 
 Each entry in a registry file should also have a 'Entity Point' and a unique value for 'Volttron Point Name'. The 'Entity ID' maps to the device instance, the 'Entity Point' extracts the attribute or state, and 'Volttron Point Name' determines the name of that point as it appears in VOLTTRON.
 

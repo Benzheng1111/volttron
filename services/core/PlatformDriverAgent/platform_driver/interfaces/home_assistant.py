@@ -23,18 +23,146 @@
 # }}}
 
 
-import random
-from math import pi
-import json
-import sys
-from platform_driver.interfaces import BaseInterface, BaseRegister, BasicRevert
-from volttron.platform.agent import utils
-from volttron.platform.vip.agent import Agent
 import logging
+import os
+import re
+from pathlib import Path
+
 import requests
-from requests import get
+from platform_driver.interfaces import BaseInterface, BaseRegister, BasicRevert
 
 _log = logging.getLogger(__name__)
+
+# (connect_sec, read_sec) — avoids indefinite hang when HA is unreachable
+_HA_REQUEST_TIMEOUT = (10, 30)
+
+_DRIVER_CONFIG_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_EXPORT_LINE = re.compile(
+    r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$"
+)
+_HA_SECRETS_CONN_CACHE = None
+
+
+def _collect_home_assistant_secrets_paths():
+    """Ordered unique paths that may contain home_assistant.secrets.env."""
+    seen = set()
+    out = []
+
+    def add(path):
+        try:
+            p = Path(path).expanduser()
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
+        except (TypeError, ValueError):
+            return
+        key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    ex = os.environ.get("HOME_ASSISTANT_SECRETS_PATH")
+    if ex:
+        add(ex)
+
+    try:
+        add(Path.cwd() / "home_assistant.secrets.env")
+    except (OSError, ValueError):
+        pass
+
+    try:
+        for parent in Path(__file__).resolve().parents:
+            add(parent / "home_assistant.secrets.env")
+    except (NameError, OSError, ValueError):
+        pass
+
+    try:
+        import volttron
+
+        vf = Path(volttron.__file__).resolve().parent
+        for _ in range(10):
+            add(vf / "home_assistant.secrets.env")
+            if vf.parent == vf:
+                break
+            vf = vf.parent
+    except Exception:
+        pass
+
+    return out
+
+
+def _first_existing_secrets_path():
+    for p in _collect_home_assistant_secrets_paths():
+        if p.is_file():
+            return p
+    return None
+
+
+def _parse_secrets_file_as_mapping(secrets_path):
+    out = {}
+    try:
+        text = secrets_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log.warning("Could not read %s: %s", secrets_path, exc)
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _EXPORT_LINE.match(line)
+        if not m:
+            continue
+        key, raw_val = m.group(1), m.group(2).strip()
+        if raw_val[:1] in "\"'" and len(raw_val) >= 2 and raw_val[-1:] == raw_val[:1]:
+            raw_val = raw_val[1:-1]
+        if not raw_val or "PASTE_YOUR_" in raw_val:
+            continue
+        out[key] = raw_val
+    return out
+
+
+def _ensure_environ_from_secrets_file():
+    """Copy secrets into os.environ for ${...} expansion in driver_config / registry."""
+    if os.environ.get("HOME_ASSISTANT_IGNORE_SECRETS_FILE") == "1":
+        return
+    path = _first_existing_secrets_path()
+    if path is None:
+        return
+    m = _parse_secrets_file_as_mapping(path)
+    for key, val in m.items():
+        if not key.startswith(("HOME_ASSISTANT", "HOMEASSISTANT")):
+            continue
+        if not os.environ.get(key):
+            os.environ[key] = val
+
+
+def _expand_env_in_string(value, field_name):
+    """Resolve ${ENV_VAR} from os.environ (after optional secrets file)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    if "${" not in value:
+        return value
+
+    _ensure_environ_from_secrets_file()
+
+    def _replace(match):
+        var = match.group(1)
+        resolved = os.environ.get(var)
+        if resolved is None or resolved == "":
+            raise ValueError(
+                "Home Assistant driver_config or registry references '${%s}' but environment "
+                "variable '%s' is not set or is empty."
+                % (var, var)
+            )
+        return resolved
+
+    return _DRIVER_CONFIG_ENV_PLACEHOLDER.sub(_replace, value.strip())
+
+
 type_mapping = {"string": str,
                 "int": int,
                 "integer": int,
@@ -57,7 +185,8 @@ class HomeAssistantRegister(BaseRegister):
 def _post_method(url, headers, data, operation_description):
     err = None
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(
+            url, headers=headers, json=data, timeout=_HA_REQUEST_TIMEOUT)
         if response.status_code == 200:
             _log.info(f"Success: {operation_description}")
         else:
@@ -81,9 +210,10 @@ class Interface(BasicRevert, BaseInterface):
         self.units = None
 
     def configure(self, config_dict, registry_config_str):
-        self.ip_address = config_dict.get("ip_address", None)
-        self.access_token = config_dict.get("access_token", None)
-        self.port = config_dict.get("port", None)
+        self.ip_address = _expand_env_in_string(config_dict.get("ip_address", None), "ip_address")
+        self.access_token = _expand_env_in_string(config_dict.get("access_token", None), "access_token")
+        port_raw = _expand_env_in_string(config_dict.get("port", None), "port")
+        self.port = str(port_raw) if port_raw is not None else None
 
         # Check for None values
         if self.ip_address is None:
@@ -155,6 +285,22 @@ class Interface(BasicRevert, BaseInterface):
             else:
                 _log.info(f"Currently, input_booleans only support state")
 
+        elif "switch." in register.entity_id:
+            if entity_point == "state":
+                if isinstance(register.value, int) and register.value in [0, 1]:
+                    if register.value == 1:
+                        self.set_switch(register.entity_id, "on")
+                    elif register.value == 0:
+                        self.set_switch(register.entity_id, "off")
+                else:
+                    error_msg = f"State value for {register.entity_id} should be an integer value of 1 or 0"
+                    _log.info(error_msg)
+                    raise ValueError(error_msg)
+            else:
+                error_msg = f"Currently, switches only support state for {register.entity_id}"
+                _log.error(error_msg)
+                raise ValueError(error_msg)
+
         # Changing thermostat values.
         elif "climate." in register.entity_id:
             if entity_point == "state":
@@ -180,7 +326,7 @@ class Interface(BasicRevert, BaseInterface):
                 raise ValueError(error_msg)
         else:
             error_msg = f"Unsupported entity_id: {register.entity_id}. " \
-                        f"Currently set_point is supported only for thermostats and lights"
+                        f"Currently set_point is supported only for thermostats, lights, input_boolean, and switch"
             _log.error(error_msg)
             raise ValueError(error_msg)
         return register.value
@@ -192,7 +338,7 @@ class Interface(BasicRevert, BaseInterface):
         }
         # the /states grabs current state AND attributes of a specific entity
         url = f"http://{self.ip_address}:{self.port}/api/states/{point_name}"
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=_HA_REQUEST_TIMEOUT)
         if response.status_code == 200:
             return response.json()  # return the json attributes from entity
         else:
@@ -236,8 +382,7 @@ class Interface(BasicRevert, BaseInterface):
                         attribute = entity_data.get("attributes", {}).get(f"{entity_point}", 0)
                         register.value = attribute
                         result[register.point_name] = attribute
-                # handling light states
-                elif "light." or "input_boolean." in entity_id: # Checks for lights or input bools since they have the same states.
+                elif ("light." in entity_id) or ("input_boolean." in entity_id):
                     if entity_point == "state":
                         state = entity_data.get("state", None)
                         # Converting light states to numbers.
@@ -277,7 +422,7 @@ class Interface(BasicRevert, BaseInterface):
                 continue
 
             read_only = str(regDef.get('Writable', '')).lower() != 'true'
-            entity_id = regDef['Entity ID']
+            entity_id = _expand_env_in_string(regDef['Entity ID'], "Entity ID")
             entity_point = regDef['Entity Point']
             self.point_name = regDef['Volttron Point Name']
             self.units = regDef['Units']
@@ -398,10 +543,16 @@ class Interface(BasicRevert, BaseInterface):
             "entity_id": entity_id
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        _post_method(url, headers, payload, f"set {entity_id} to {state}")
 
-        # Optionally check for a successful response
-        if response.status_code == 200:
-            print(f"Successfully set {entity_id} to {state}")
-        else:
-            print(f"Failed to set {entity_id} to {state}: {response.text}")
+    def set_switch(self, entity_id, state):
+        service = 'turn_on' if state == 'on' else 'turn_off'
+        url = f"http://{self.ip_address}:{self.port}/api/services/switch/{service}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "entity_id": entity_id
+        }
+        _post_method(url, headers, payload, f"set {entity_id} to {state}")

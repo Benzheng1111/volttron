@@ -176,3 +176,4 @@ To view data being published from the fake driver on the message bus, one can
    obix/obix
    ted-driver/the-energy-detective-driver
    home-assistant/HomeAssistantDriver
+   home-assistant/HomeAssistantCustomerGuide

@@ -1,0 +1,10 @@
+[
+  {
+    "Entity ID": "light.bed_light",
+    "Entity Point": "state",
+    "Volttron Point Name": "light_state",
+    "Units": "On / Off",
+    "Writable": true,
+    "Type": "int"
+  }
+]

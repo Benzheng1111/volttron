@@ -24,8 +24,12 @@
 
 import json
 import logging
-import pytest
+import os
+import re
+from pathlib import Path
+
 import gevent
+import pytest
 
 from volttron.platform.agent.known_identities import (
     PLATFORM_DRIVER,
@@ -33,26 +37,110 @@ from volttron.platform.agent.known_identities import (
 )
 from volttron.platform import get_services_core
 from volttron.platform.agent import utils
-from volttron.platform.keystore import KeyStore
 from volttrontesting.utils.platformwrapper import PlatformWrapper
 
 utils.setup_logging()
 logger = logging.getLogger(__name__)
 
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_EXPORT_LINE = re.compile(
+    r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$"
+)
+
+
+def _load_home_assistant_secrets_file():
+    """Merge repo-root ``home_assistant.secrets.env`` into the process env (no shell ``source`` needed)."""
+    path = os.environ.get("HOME_ASSISTANT_SECRETS_PATH")
+    if path:
+        secrets_path = Path(path).expanduser()
+    else:
+        secrets_path = _REPO_ROOT / "home_assistant.secrets.env"
+    if not secrets_path.is_file():
+        return
+    try:
+        text = secrets_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", secrets_path, exc)
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _EXPORT_LINE.match(line)
+        if not m:
+            continue
+        key, raw_val = m.group(1), m.group(2).strip()
+        if raw_val[:1] in "\"'" and len(raw_val) >= 2 and raw_val[-1:] == raw_val[:1]:
+            raw_val = raw_val[1:-1]
+        if not raw_val or "PASTE_YOUR_" in raw_val:
+            continue
+        if not key.startswith(("HOME_ASSISTANT", "HOMEASSISTANT")):
+            continue
+        # Do not override non-empty values from the parent shell / CI
+        if os.environ.get(key, "").strip():
+            continue
+        os.environ[key] = raw_val
+
+
+_load_home_assistant_secrets_file()
+
 # To run these tests, create a helper toggle named volttrontest in your Home Assistant instance.
 # This can be done by going to Settings > Devices & services > Helpers > Create Helper > Toggle
-HOMEASSISTANT_TEST_IP = ""
-ACCESS_TOKEN = ""
-PORT = ""
+#
+# Credentials: ``home_assistant.secrets.env`` at repo root is read automatically; you may still
+# ``export`` the same variables. See home_assistant_integration.env.example.
+HOMEASSISTANT_TEST_IP = (
+    os.environ.get("HOMEASSISTANT_TEST_IP", "").strip()
+    or os.environ.get("HOME_ASSISTANT_IP", "").strip()
+)
+ACCESS_TOKEN = (
+    os.environ.get("HOMEASSISTANT_ACCESS_TOKEN", "").strip()
+    or os.environ.get("HOME_ASSISTANT_TOKEN", "").strip()
+)
+PORT = (
+    os.environ.get("HOMEASSISTANT_PORT", "").strip()
+    or os.environ.get("HOME_ASSISTANT_PORT", "").strip()
+    or "8123"
+)
 
-skip_msg = "Some configuration variables are not set. Check HOMEASSISTANT_TEST_IP, ACCESS_TOKEN, and PORT"
+skip_msg = (
+    "Set credentials in repo-root home_assistant.secrets.env (or export HOMEASSISTANT_TEST_IP + "
+    "HOMEASSISTANT_ACCESS_TOKEN / HOME_ASSISTANT_IP + HOME_ASSISTANT_TOKEN)"
+)
 
-# Skip tests if variables are not set
+# Skip tests if IP/token are not set (PORT defaults to 8123)
 pytestmark = pytest.mark.skipif(
-    not (HOMEASSISTANT_TEST_IP and ACCESS_TOKEN and PORT),
+    not (HOMEASSISTANT_TEST_IP and ACCESS_TOKEN),
     reason=skip_msg
 )
 HOMEASSISTANT_DEVICE_TOPIC = "devices/home_assistant"
+
+
+@pytest.fixture(scope="module")
+def volttron_instance():
+    """One ZMQ instance with default auth.
+
+    Overrides the global ``volttron_instance`` parametrize (ZMQ / RMQ / ZMQ+no-auth): RMQ is
+    skipped in CI; ``auth_enabled=False`` can break dynamic agent config store (no ``auth``
+    subsystem), leaving devices unregistered (``KeyError: 'home_assistant'``).
+    """
+    from volttrontesting.fixtures.volttron_platform_fixtures import (
+        build_wrapper,
+        cleanup_wrapper,
+    )
+    from volttrontesting.utils.utils import get_rand_vip
+
+    address = get_rand_vip()
+    wrapper = build_wrapper(
+        address,
+        messagebus="zmq",
+        ssl_auth=False,
+        auth_enabled=True,
+    )
+    try:
+        yield wrapper
+    finally:
+        cleanup_wrapper(wrapper)
 
 
 # Get the point which will should be off
@@ -77,7 +165,7 @@ def test_data_poll(volttron_instance: PlatformWrapper, config_store):
 def test_set_point(volttron_instance, config_store):
     expected_values = {'bool_state': 1}
     agent = volttron_instance.dynamic_agent
-    agent.vip.rpc.call(PLATFORM_DRIVER, 'set_point', 'home_assistant', 'bool_state', 1)
+    agent.vip.rpc.call(PLATFORM_DRIVER, 'set_point', 'home_assistant', 'bool_state', 1).get(timeout=30)
     gevent.sleep(10)
     result = agent.vip.rpc.call(PLATFORM_DRIVER, 'scrape_all', 'home_assistant').get(timeout=20)
     assert result == expected_values, "The result does not match the expected result."
@@ -89,7 +177,7 @@ def config_store(volttron_instance, platform_driver):
     capabilities = [{"edit_config_store": {"identity": PLATFORM_DRIVER}}]
     volttron_instance.add_capabilities(volttron_instance.dynamic_agent.core.publickey, capabilities)
 
-    registry_config = "homeassistant_test.json"
+    # Inline registry list (no config://) so the driver does not need config-store resolution in DriverAgent.
     registry_obj = [{
         "Entity ID": "input_boolean.volttrontest",
         "Entity Point": "state",
@@ -102,18 +190,11 @@ def config_store(volttron_instance, platform_driver):
         "Notes": "lights hallway"
     }]
 
-    volttron_instance.dynamic_agent.vip.rpc.call(CONFIGURATION_STORE,
-                                                 "manage_store",
-                                                 PLATFORM_DRIVER,
-                                                 registry_config,
-                                                 json.dumps(registry_obj),
-                                                 config_type="json")
-    gevent.sleep(2)
     # driver config
     driver_config = {
         "driver_config": {"ip_address": HOMEASSISTANT_TEST_IP, "access_token": ACCESS_TOKEN, "port": PORT},
         "driver_type": "home_assistant",
-        "registry_config": f"config://{registry_config}",
+        "registry_config": registry_obj,
         "timezone": "US/Pacific",
         "interval": 30,
     }
